@@ -133,6 +133,7 @@ async def test_poll_marks_watch_ended_when_broadcast_ends(monkeypatch):
     watch = _watch(state="live", active_live_video_id="video-123")
     monkeypatch.setattr("src.database.AsyncSessionLocal", _fake_async_session_local())
     _patch_repo_defaults(monkeypatch, tracking=[watch])
+    monkeypatch.setattr(feature_flags, "is_enabled", AsyncMock(return_value=True))
     monkeypatch.setattr(detection, "has_broadcast_ended", AsyncMock(return_value=True))
     mark_ended = AsyncMock()
     monkeypatch.setattr(ChannelWatchRepository, "mark_ended", mark_ended)
@@ -148,12 +149,32 @@ async def test_poll_leaves_watch_live_when_broadcast_still_running(monkeypatch):
     watch = _watch(state="live", active_live_video_id="video-123")
     monkeypatch.setattr("src.database.AsyncSessionLocal", _fake_async_session_local())
     _patch_repo_defaults(monkeypatch, tracking=[watch])
+    monkeypatch.setattr(feature_flags, "is_enabled", AsyncMock(return_value=True))
     monkeypatch.setattr(detection, "has_broadcast_ended", AsyncMock(return_value=False))
     mark_ended = AsyncMock()
     monkeypatch.setattr(ChannelWatchRepository, "mark_ended", mark_ended)
 
     result = await tasks.poll_channel_watches({})
 
+    mark_ended.assert_not_awaited()
+    assert result["marked_ended"] == 0
+    assert result["errors"] == 0
+
+
+async def test_poll_skips_live_tracking_when_channel_watching_disabled(monkeypatch):
+    """A disabled flag must stop polling an in-flight `live` row too, not just idle ones."""
+    watch = _watch(state="live", active_live_video_id="video-123")
+    monkeypatch.setattr("src.database.AsyncSessionLocal", _fake_async_session_local())
+    _patch_repo_defaults(monkeypatch, tracking=[watch])
+    monkeypatch.setattr(feature_flags, "is_enabled", AsyncMock(return_value=False))
+    has_ended = AsyncMock()
+    monkeypatch.setattr(detection, "has_broadcast_ended", has_ended)
+    mark_ended = AsyncMock()
+    monkeypatch.setattr(ChannelWatchRepository, "mark_ended", mark_ended)
+
+    result = await tasks.poll_channel_watches({})
+
+    has_ended.assert_not_awaited()
     mark_ended.assert_not_awaited()
     assert result["marked_ended"] == 0
 
@@ -168,6 +189,7 @@ async def test_poll_creates_suggestion_when_vod_duration_resolves(monkeypatch):
     watch = _watch(state="ended_pending_vod", active_live_video_id="video-999", ended_at=ended_at)
     monkeypatch.setattr("src.database.AsyncSessionLocal", _fake_async_session_local())
     _patch_repo_defaults(monkeypatch, tracking=[watch])
+    monkeypatch.setattr(feature_flags, "is_enabled", AsyncMock(return_value=True))
     monkeypatch.setattr(
         youtube_utils, "async_get_youtube_video_info", AsyncMock(return_value={"duration": 1234})
     )
@@ -188,6 +210,7 @@ async def test_poll_creates_suggestion_when_vod_duration_resolves(monkeypatch):
         reset_to_idle.call_args.args[0], "watch-1"
     )
     assert result["suggestions_created"] == 1
+    assert result["errors"] == 0
 
 
 async def test_poll_leaves_pending_vod_watch_when_duration_unresolved_and_not_timed_out(monkeypatch):
@@ -195,6 +218,7 @@ async def test_poll_leaves_pending_vod_watch_when_duration_unresolved_and_not_ti
     watch = _watch(state="ended_pending_vod", active_live_video_id="video-999", ended_at=ended_at)
     monkeypatch.setattr("src.database.AsyncSessionLocal", _fake_async_session_local())
     _patch_repo_defaults(monkeypatch, tracking=[watch])
+    monkeypatch.setattr(feature_flags, "is_enabled", AsyncMock(return_value=True))
     monkeypatch.setattr(
         youtube_utils, "async_get_youtube_video_info", AsyncMock(return_value=None)
     )
@@ -208,6 +232,7 @@ async def test_poll_leaves_pending_vod_watch_when_duration_unresolved_and_not_ti
     create.assert_not_awaited()
     reset_to_idle.assert_not_awaited()
     assert result["suggestions_created"] == 0
+    assert result["errors"] == 0
 
 
 async def test_poll_marks_suggestion_failed_after_vod_timeout(monkeypatch):
@@ -217,6 +242,7 @@ async def test_poll_marks_suggestion_failed_after_vod_timeout(monkeypatch):
     watch = _watch(state="ended_pending_vod", active_live_video_id="video-999", ended_at=ended_at)
     monkeypatch.setattr("src.database.AsyncSessionLocal", _fake_async_session_local())
     _patch_repo_defaults(monkeypatch, tracking=[watch])
+    monkeypatch.setattr(feature_flags, "is_enabled", AsyncMock(return_value=True))
     monkeypatch.setattr(
         youtube_utils, "async_get_youtube_video_info", AsyncMock(return_value=None)
     )
@@ -232,8 +258,32 @@ async def test_poll_marks_suggestion_failed_after_vod_timeout(monkeypatch):
     assert kwargs["status"] == "failed"
     assert kwargs.get("duration_seconds") is None
     reset_to_idle.assert_awaited_once()
+    assert result["errors"] == 0
     assert result["suggestions_created"] == 0
     assert result["suggestions_failed"] == 1
+
+
+async def test_poll_skips_vod_resolution_when_channel_watching_disabled(monkeypatch):
+    """A disabled flag must stop polling an in-flight `ended_pending_vod` row too."""
+    ended_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+    watch = _watch(state="ended_pending_vod", active_live_video_id="video-999", ended_at=ended_at)
+    monkeypatch.setattr("src.database.AsyncSessionLocal", _fake_async_session_local())
+    _patch_repo_defaults(monkeypatch, tracking=[watch])
+    monkeypatch.setattr(feature_flags, "is_enabled", AsyncMock(return_value=False))
+    get_video_info = AsyncMock()
+    monkeypatch.setattr(youtube_utils, "async_get_youtube_video_info", get_video_info)
+    create = AsyncMock()
+    monkeypatch.setattr(ChannelWatchSuggestionRepository, "create", create)
+    reset_to_idle = AsyncMock()
+    monkeypatch.setattr(ChannelWatchRepository, "reset_to_idle", reset_to_idle)
+
+    result = await tasks.poll_channel_watches({})
+
+    get_video_info.assert_not_awaited()
+    create.assert_not_awaited()
+    reset_to_idle.assert_not_awaited()
+    assert result["suggestions_created"] == 0
+    assert result["suggestions_failed"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -263,4 +313,34 @@ async def test_poll_continues_past_one_rows_exception(monkeypatch):
     mark_live.assert_awaited_once()
     assert mark_live.call_args.args[1] == "watch-b"
     assert result["marked_live"] == 1
+    assert result["errors"] == 1
+
+
+async def test_poll_continues_past_one_rows_exception_in_tracking_phase(monkeypatch):
+    """One tracking row's (``live`` or ``ended_pending_vod``) exception must not stop the
+    other row in the same loop from being checked."""
+    watch_a = _watch(
+        id="watch-a", user_id="user-a", state="live", active_live_video_id="video-a"
+    )
+    watch_b = _watch(
+        id="watch-b", user_id="user-b", state="live", active_live_video_id="video-b"
+    )
+    monkeypatch.setattr("src.database.AsyncSessionLocal", _fake_async_session_local())
+    _patch_repo_defaults(monkeypatch, tracking=[watch_a, watch_b])
+    monkeypatch.setattr(feature_flags, "is_enabled", AsyncMock(return_value=True))
+
+    async def fake_has_ended(video_id):
+        if video_id == "video-a":
+            raise RuntimeError("boom")
+        return True
+
+    monkeypatch.setattr(detection, "has_broadcast_ended", fake_has_ended)
+    mark_ended = AsyncMock()
+    monkeypatch.setattr(ChannelWatchRepository, "mark_ended", mark_ended)
+
+    result = await tasks.poll_channel_watches({})
+
+    mark_ended.assert_awaited_once()
+    assert mark_ended.call_args.args[1] == "watch-b"
+    assert result["marked_ended"] == 1
     assert result["errors"] == 1

@@ -328,6 +328,14 @@ async def poll_channel_watches(ctx: Dict[str, Any]) -> Dict[str, Any]:
         )
         for watch in tracking_watches:
             try:
+                if not await feature_flags.is_enabled(
+                    db, "channel_watching", platform="web", user_id=watch["user_id"]
+                ):
+                    # Same as the idle-sweep phase: a disabled flag stops polling this
+                    # row outright, even mid-broadcast or mid-VOD-wait, not just the UI
+                    # that would act on a suggestion.
+                    continue
+
                 if watch["state"] == "live":
                     ended = await has_broadcast_ended(watch["active_live_video_id"])
                     if ended:
