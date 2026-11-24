@@ -3,6 +3,7 @@ Worker tasks - background jobs processed by arq workers.
 """
 
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional
 import json
 from arq import Retry
@@ -256,6 +257,207 @@ async def refresh_social_metrics(ctx: Dict[str, Any]) -> Dict[str, Any]:
         refreshed = await service.refresh_due_metrics()
         purged = await SocialRepository.purge_expired_oauth_states(db)
     return {"refreshed": refreshed, "purged_oauth_states": purged}
+
+
+# A watch is only re-probed this often; list_enabled_idle treats a never-checked
+# row as always stale, so a brand-new watch is still picked up on the next tick.
+CHANNEL_WATCH_IDLE_SWEEP_INTERVAL_SECONDS = 300
+# How long an ended_pending_vod watch may wait for its VOD's duration to resolve
+# before the suggestion is given up on (status "failed") and the watch reset.
+CHANNEL_WATCH_VOD_TIMEOUT_SECONDS = 7200
+
+
+async def _send_channel_watch_notification_if_needed(db, suggestion_id: str) -> None:
+    """Email the owner that their watched channel's VOD is ready to clip.
+
+    Mirrors ``SocialService._send_publish_notification_if_needed``: every step
+    is wrapped so a failure here (missing context, SES down, a bad send) never
+    breaks the cron tick that created the suggestion.
+    """
+    from ..repositories.channel_watch_repository import ChannelWatchSuggestionRepository
+    from ..services.channel_watch_email_service import ChannelWatchEmailService
+
+    try:
+        context = await ChannelWatchSuggestionRepository.get_notification_context(
+            db, suggestion_id
+        )
+    except Exception:  # noqa: BLE001 - notification must never fail the poll
+        logger.exception(
+            "Failed to load channel-watch notification context for suggestion %s",
+            suggestion_id,
+        )
+        return
+    if not context:
+        logger.warning(
+            "Channel-watch suggestion %s missing notification context; skipping email",
+            suggestion_id,
+        )
+        return
+    if not context.get("notify_on_channel_watch"):
+        return
+    if context.get("notified_at"):
+        logger.info(
+            "Channel-watch notification already sent for suggestion %s; skipping",
+            suggestion_id,
+        )
+        return
+    user_email = context.get("user_email")
+    if not user_email:
+        logger.warning(
+            "Channel-watch suggestion %s has notify_on_channel_watch enabled but "
+            "user email is missing",
+            suggestion_id,
+        )
+        return
+    email_service = ChannelWatchEmailService()
+    if not email_service.is_configured:
+        logger.warning(
+            "Skipping channel-watch notification for suggestion %s because Amazon "
+            "SES is not configured",
+            suggestion_id,
+        )
+        return
+    try:
+        await email_service.send_stream_ready_email(
+            recipient=user_email,
+            channel_title=context.get("channel_title"),
+            video_url=context["video_url"],
+            duration_seconds=context.get("duration_seconds") or 0,
+        )
+        await ChannelWatchSuggestionRepository.mark_notified(db, suggestion_id)
+    except Exception:  # noqa: BLE001 - notification must never fail the poll
+        logger.exception(
+            "Failed to send channel-watch notification for suggestion %s", suggestion_id
+        )
+
+
+async def poll_channel_watches(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Cron: advance every enabled YouTube channel watch through its state machine.
+
+    Three independent phases, each reading its own rows and each isolating a
+    single row's failure from the rest of the sweep:
+
+    1. idle sweep - discover a channel that has just gone live
+    2. live tracking - notice an already-known-live broadcast has ended
+    3. VOD resolution - once the VOD's duration resolves, create a suggestion
+       and reset the watch to idle; past a bounded timeout, fail it out instead
+       of polling forever.
+    """
+    from .. import feature_flags
+    from ..channel_watch_detection import has_broadcast_ended, probe_channel_live
+    from ..database import AsyncSessionLocal
+    from ..repositories.channel_watch_repository import (
+        ChannelWatchRepository,
+        ChannelWatchSuggestionRepository,
+    )
+    from ..youtube_utils import async_get_youtube_video_info, has_verified_duration
+
+    now = datetime.now(timezone.utc)
+    marked_live = 0
+    marked_ended = 0
+    suggestions_created = 0
+    suggestions_failed = 0
+    errors = 0
+
+    async with AsyncSessionLocal() as db:
+        stale_before = now - timedelta(seconds=CHANNEL_WATCH_IDLE_SWEEP_INTERVAL_SECONDS)
+        idle_watches = await ChannelWatchRepository.list_enabled_idle(
+            db, platform="youtube", stale_before=stale_before
+        )
+        for watch in idle_watches:
+            try:
+                if not await feature_flags.is_enabled(
+                    db, "channel_watching", platform="web", user_id=watch["user_id"]
+                ):
+                    # A disabled flag stops polling outright (it would otherwise
+                    # keep calling yt-dlp against YouTube on every tick), not just
+                    # the UI that would act on a suggestion.
+                    continue
+
+                video_id = await probe_channel_live(watch["resolved_channel_id"])
+                if video_id:
+                    await ChannelWatchRepository.mark_live(
+                        db, watch["id"], video_id=video_id, started_at=now
+                    )
+                    marked_live += 1
+                await ChannelWatchRepository.touch_last_checked(
+                    db, watch["id"], method="idle_sweep"
+                )
+            except Exception:
+                errors += 1
+                logger.exception("Idle-sweep check failed for channel watch %s", watch["id"])
+
+        tracking_watches = await ChannelWatchRepository.list_enabled_tracking(
+            db, platform="youtube"
+        )
+        for watch in tracking_watches:
+            try:
+                if not await feature_flags.is_enabled(
+                    db, "channel_watching", platform="web", user_id=watch["user_id"]
+                ):
+                    # Same as the idle-sweep phase: a disabled flag stops polling this
+                    # row outright, even mid-broadcast or mid-VOD-wait, not just the UI
+                    # that would act on a suggestion.
+                    continue
+
+                if watch["state"] == "live":
+                    ended = await has_broadcast_ended(watch["active_live_video_id"])
+                    if ended:
+                        await ChannelWatchRepository.mark_ended(db, watch["id"], ended_at=now)
+                        marked_ended += 1
+                    continue
+
+                if watch["state"] != "ended_pending_vod":
+                    continue
+
+                video_id = watch["active_live_video_id"]
+                video_info = await async_get_youtube_video_info(
+                    f"https://www.youtube.com/watch?v={video_id}"
+                )
+                if has_verified_duration(video_info):
+                    suggestion = await ChannelWatchSuggestionRepository.create(
+                        db,
+                        channel_watch_id=watch["id"],
+                        user_id=watch["user_id"],
+                        video_id=video_id,
+                        video_url=f"https://www.youtube.com/watch?v={video_id}",
+                        status="pending",
+                        duration_seconds=int(video_info["duration"]),
+                    )
+                    await ChannelWatchRepository.reset_to_idle(db, watch["id"])
+                    suggestions_created += 1
+                    await _send_channel_watch_notification_if_needed(db, suggestion["id"])
+                    continue
+
+                ended_at = watch.get("ended_at")
+                timed_out = (
+                    ended_at is not None
+                    and (now - ended_at).total_seconds() > CHANNEL_WATCH_VOD_TIMEOUT_SECONDS
+                )
+                if timed_out:
+                    await ChannelWatchSuggestionRepository.create(
+                        db,
+                        channel_watch_id=watch["id"],
+                        user_id=watch["user_id"],
+                        video_id=video_id,
+                        video_url=f"https://www.youtube.com/watch?v={video_id}",
+                        status="failed",
+                    )
+                    await ChannelWatchRepository.reset_to_idle(db, watch["id"])
+                    suggestions_failed += 1
+                # Otherwise: duration not resolvable yet and not timed out -
+                # leave the row as-is for the next tick.
+            except Exception:
+                errors += 1
+                logger.exception("Tracking check failed for channel watch %s", watch["id"])
+
+    return {
+        "marked_live": marked_live,
+        "marked_ended": marked_ended,
+        "suggestions_created": suggestions_created,
+        "suggestions_failed": suggestions_failed,
+        "errors": errors,
+    }
 
 
 SCRATCH_SWEEP_SECONDS = 10 * 60
