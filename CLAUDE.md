@@ -319,7 +319,8 @@ PEXELS_API_KEY=...                   # B-roll stock footage
 YOUTUBE_OAUTH_CLIENT_ID=...          # Social publishing: Google OAuth client (+ _SECRET)
 TIKTOK_CLIENT_KEY=...                # Social publishing: TikTok app (+ TIKTOK_CLIENT_SECRET)
 TIKTOK_APP_AUDITED=false             # true only after TikTok's audit; unaudited = private posts from private accounts
-INSTAGRAM_APP_ID=...                 # Social publishing: Meta app with Instagram Login (+ _SECRET)
+INSTAGRAM_APP_ID=...                 # Social publishing: Meta app, "API setup with Unified login" (+ _SECRET)
+INSTAGRAM_CONFIG_ID=...               # Unified login Configuration ID (replaces a scope list)
 SOCIAL_PERFORMANCE_MIN_POSTS=3       # Measured posts before AI selection is personalized
 SOCIAL_PUBLISHING_ACCESS=off         # Rollout gate: off (default) | admins (admins + allowlist) | all
 SOCIAL_PUBLISHING_ALLOWED_EMAILS=    # Comma-separated beta emails when access=admins

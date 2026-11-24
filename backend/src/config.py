@@ -282,6 +282,12 @@ class Config:
         self.instagram_app_secret = self._get_optional_env(
             "INSTAGRAM_APP_SECRET"
         ) or self._get_optional_env("META_APP_SECRET")
+        # Meta retired "API setup with Instagram login" for new apps; the only
+        # path left is "API setup with Unified login" (Facebook Login for
+        # Business), whose authorize dialog takes a Configuration ID instead
+        # of a scope list. Find it on the use case's "API setup with Unified
+        # login" page after creating a configuration.
+        self.instagram_config_id = self._get_optional_env("INSTAGRAM_CONFIG_ID")
         # OAuth callbacks and public media fetches (Instagram pulls the video
         # from a URL) both go through the frontend, so they default to the
         # public app URL.

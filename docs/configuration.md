@@ -401,7 +401,8 @@ that app from **Settings → Social Accounts**; tokens are stored encrypted with
 |---|---|
 | `YOUTUBE_OAUTH_CLIENT_ID` / `YOUTUBE_OAUTH_CLIENT_SECRET` | Google OAuth client (Web application) with the YouTube Data API v3 enabled. `GOOGLE_OAUTH_CLIENT_ID` / `_SECRET` are accepted as aliases. |
 | `TIKTOK_CLIENT_KEY` / `TIKTOK_CLIENT_SECRET` | TikTok for Developers app with Login Kit and the Content Posting API (scopes `user.info.basic`, `video.publish`, `video.list`) |
-| `INSTAGRAM_APP_ID` / `INSTAGRAM_APP_SECRET` | Meta app using "Instagram API with Instagram Login". `META_APP_ID` / `META_APP_SECRET` are accepted as aliases. |
+| `INSTAGRAM_APP_ID` / `INSTAGRAM_APP_SECRET` | Meta app using "API setup with Unified login" (Meta retired the standalone "Instagram API with Instagram Login" for apps created after mid-2026). `META_APP_ID` / `META_APP_SECRET` are accepted as aliases. |
+| `INSTAGRAM_CONFIG_ID` | The Unified Login configuration's Configuration ID, from the same "API setup with Unified login" page. Its permission set replaces a scope list; request only `instagram_basic`, `instagram_content_publish` and `instagram_manage_insights`. |
 | `SOCIAL_OAUTH_REDIRECT_BASE_URL` | Base URL for OAuth callbacks; defaults to `NEXT_PUBLIC_APP_URL` |
 | `SOCIAL_PUBLIC_MEDIA_BASE_URL` | Base URL Instagram fetches videos from; defaults to `NEXT_PUBLIC_APP_URL` and must be publicly reachable |
 | `SOCIAL_METRICS_REFRESH_HOURS` | Minimum hours between metric pulls per post (default `6`) |
@@ -450,8 +451,11 @@ Platform review notes (the APIs themselves are free):
   requires TikTok's app audit. Leave `TIKTOK_APP_AUDITED` unset (false) until
   the audit passes: SupoClip then offers only Private and tells users to switch
   their account to Private. Set it to `true` after approval.
-- **Instagram**: requires a professional (Business or Creator) account. Meta App
-  Review is needed before accounts outside the app's testers can connect.
+- **Instagram**: requires a professional (Business or Creator) account. The app
+  must use "API setup with Unified login" (a Facebook Login for Business
+  configuration with a System-User Access Token); Meta no longer offers the
+  older direct Instagram-login setup to new apps. Meta App Review is needed
+  before accounts outside the app's testers can connect.
 
 ### Deployment and verification
 

@@ -58,6 +58,7 @@ def _config(**overrides) -> Config:
     config.tiktok_client_secret = "tt-secret"
     config.instagram_app_id = "ig-app"
     config.instagram_app_secret = "ig-secret"
+    config.instagram_config_id = "ig-config"
     for key, value in overrides.items():
         setattr(config, key, value)
     return config
@@ -436,11 +437,49 @@ def test_instagram_requires_public_media_url(clip_file):
         )
 
 
+def test_instagram_authorize_url_uses_config_id_not_scopes():
+    provider = InstagramProvider(_config(), session=FakeSession({}))
+    url = provider.build_authorize_url(state="xyz", redirect_uri="https://app/cb")
+    query = parse_qs(urlparse(url).query)
+    assert url.startswith("https://www.facebook.com/dialog/oauth?")
+    assert query["client_id"] == ["ig-app"]
+    assert query["config_id"] == ["ig-config"]
+    assert query["redirect_uri"] == ["https://app/cb"]
+    assert query["response_type"] == ["code"]
+    assert query["state"] == ["xyz"]
+    assert "scope" not in query
+
+
+def test_instagram_fetch_profile_returns_connected_account():
+    session = FakeSession(
+        {
+            ("GET", "/me/assigned_instagram_accounts"): FakeResponse(
+                200, {"data": [{"id": "ig-1", "username": "creator"}]}
+            ),
+            ("GET", "/ig-1"): FakeResponse(
+                200, {"name": "Creator", "profile_picture_url": "https://cdn/pic.jpg"}
+            ),
+        }
+    )
+    provider = InstagramProvider(_config(), session=session, sleep=lambda _: None)
+    profile = provider.fetch_profile("token")
+    assert profile.external_account_id == "ig-1"
+    assert profile.username == "creator"
+    assert profile.metadata == {"ig_user_id": "ig-1"}
+
+
+def test_instagram_fetch_profile_requires_a_connected_account():
+    session = FakeSession({("GET", "/me/assigned_instagram_accounts"): FakeResponse(200, {"data": []})})
+    provider = InstagramProvider(_config(), session=session, sleep=lambda _: None)
+    with pytest.raises(SocialProviderError, match="No Instagram professional account"):
+        provider.fetch_profile("token")
+
+
 def test_instagram_publish_polls_container_then_publishes(clip_file):
     session = FakeSession(
         {
-            ("POST", "/me/media_publish"): FakeResponse(200, {"id": "media-9"}),
-            ("POST", "/me/media"): FakeResponse(200, {"id": "container-1"}),
+            ("POST", "/ig-1/media_publish"): FakeResponse(200, {"id": "media-9"}),
+            ("POST", "/ig-1/media"): FakeResponse(200, {"id": "container-1"}),
             ("GET", "/container-1"): [
                 FakeResponse(200, {"status_code": "IN_PROGRESS"}),
                 FakeResponse(200, {"status_code": "FINISHED"}),
@@ -460,12 +499,13 @@ def test_instagram_publish_polls_container_then_publishes(clip_file):
             hashtags=["reels"],
             privacy_level="public",
             public_media_url="https://app.example/api/social/media/tok",
+            account_metadata={"ig_user_id": "ig-1"},
         ),
     )
     assert result.external_post_id == "media-9"
     assert result.external_url == "https://instagram.com/reel/abc"
 
-    create_call = next(call for call in session.calls if call[1].endswith("/me/media"))
+    create_call = next(call for call in session.calls if call[1].endswith("/ig-1/media"))
     # Tokens travel in the Authorization header, never in URLs or form bodies.
     for _method, _url, kwargs in session.calls:
         assert kwargs["headers"]["Authorization"] == "Bearer token"
@@ -474,6 +514,24 @@ def test_instagram_publish_polls_container_then_publishes(clip_file):
     assert create_call[2]["data"]["media_type"] == "REELS"
     assert create_call[2]["data"]["video_url"] == "https://app.example/api/social/media/tok"
     assert create_call[2]["data"]["caption"] == "Caption\n\n#reels"
+
+
+def test_instagram_publish_requires_an_ig_user_id(clip_file):
+    provider = InstagramProvider(_config(), session=FakeSession({}), sleep=lambda _: None)
+    from src.social.base import PublishRequest
+
+    with pytest.raises(SocialProviderError, match="reconnect"):
+        provider.publish(
+            "token",
+            PublishRequest(
+                file_path=clip_file,
+                title="t",
+                caption="c",
+                hashtags=[],
+                privacy_level="public",
+                public_media_url="https://app.example/clip.mp4",
+            ),
+        )
 
 
 def test_instagram_metrics_fall_back_between_metric_sets():
@@ -500,17 +558,11 @@ def test_instagram_metrics_fall_back_between_metric_sets():
     assert metrics.as_dict() == {"views": 900, "likes": 30, "comments": 4, "shares": 12, "saves": 5}
 
 
-def test_instagram_profile_requires_professional_account():
-    session = FakeSession(
-        {
-            ("GET", "/me"): FakeResponse(
-                200, {"id": "1", "user_id": "2", "username": "me", "account_type": "PERSONAL"}
-            )
-        }
-    )
-    provider = InstagramProvider(_config(), session=session, sleep=lambda _: None)
-    with pytest.raises(SocialProviderError, match="professional"):
-        provider.fetch_profile("token")
+def test_instagram_refresh_tokens_is_unsupported():
+    provider = InstagramProvider(_config(), session=FakeSession({}), sleep=lambda _: None)
+    with pytest.raises(SocialProviderError, match="does not support refreshing") as exc:
+        provider.refresh_tokens("whatever")
+    assert exc.value.reauth is True
 
 
 def test_instagram_token_endpoint_failures_are_redacted():
@@ -525,8 +577,11 @@ def test_instagram_token_endpoint_failures_are_redacted():
 
     provider = InstagramProvider(_config(), session=LeakySession({}), sleep=lambda _: None)
     with pytest.raises(SocialProviderError) as exc:
-        redacted_errors(provider.refresh_tokens)("IGQVJlong-lived-secret")
+        redacted_errors(provider.exchange_code)(
+            code="IGQVJlong-lived-secret", redirect_uri="https://app/cb"
+        )
     assert "IGQVJlong-lived-secret" not in str(exc.value)
+    assert "ig-secret" not in str(exc.value)
     assert exc.value.retryable is True
     assert exc.value.__suppress_context__ is True
 
@@ -594,12 +649,17 @@ def test_instagram_timeout_on_media_publish_is_outcome_unknown(clip_file):
 
     def session(**routes):
         return RaisingSession({
-            ("POST", "/me/media_publish"): routes.get("publish", FakeResponse(200, {"id": "m"})),
-            ("POST", "/me/media"): routes.get("create", FakeResponse(200, {"id": "container-1"})),
+            ("POST", "/ig-1/media_publish"): routes.get("publish", FakeResponse(200, {"id": "m"})),
+            ("POST", "/ig-1/media"): routes.get("create", FakeResponse(200, {"id": "container-1"})),
             ("GET", "/container-1"): FakeResponse(200, {"status_code": "FINISHED"}),
         })
 
-    request = _request(clip_file, privacy_level="public", public_media_url="https://media/x")
+    request = _request(
+        clip_file,
+        privacy_level="public",
+        public_media_url="https://media/x",
+        account_metadata={"ig_user_id": "ig-1"},
+    )
     provider = InstagramProvider(
         _config(), session=session(publish=requests.ConnectionError("reset")), sleep=lambda _: None
     )

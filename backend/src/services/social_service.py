@@ -379,8 +379,9 @@ class SocialService:
         refresh_token = decrypt_setting_value(refresh_encrypted) if refresh_encrypted else None
         expires_at = _parse_datetime(account.get("token_expires_at"))
 
-        # Instagram long-lived tokens last 60 days and may only be refreshed
-        # once they are older than a day, so refresh well ahead of expiry.
+        # Instagram's Unified Login token is a System-User Access Token with
+        # no expires_at/refresh_token, so this window never applies to it;
+        # kept generic in case a future provider needs a longer lead time.
         window = timedelta(days=7) if provider.name == "instagram" else timedelta(minutes=5)
         needs_refresh = bool(
             expires_at and refresh_token and expires_at - datetime.now(timezone.utc) < window

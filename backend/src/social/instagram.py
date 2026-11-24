@@ -1,22 +1,31 @@
 """
-Instagram Reels publishing via the Instagram API with Instagram Login.
+Instagram Reels publishing via the Instagram API with Unified Login.
 
-This is Meta's newer "business login" flow: it needs an Instagram
-professional (Business or Creator) account but *not* a linked Facebook Page.
+Meta retired the standalone "API setup with Instagram login" for apps
+created after mid-2026; every new app is routed to "API setup with Unified
+login" instead, which is Facebook Login for Business configured with a
+System-User Access Token (SUAT). Practical differences from the old flow:
 
-OAuth: ``instagram.com/oauth/authorize`` -> short-lived token ->
-long-lived token (60 days, refreshable once it is older than 24 hours).
-Upload: Instagram does not accept file uploads. It fetches the video from a
-public URL, so the caller must supply ``PublishRequest.public_media_url``.
-Metrics: ``/{media_id}?fields=like_count,comments_count`` plus
-``/{media_id}/insights``.
+- The authorize dialog is Facebook's (``facebook.com/dialog/oauth``) and
+  takes a ``config_id`` instead of a ``scope`` list; the permissions are
+  chosen once, in the Meta dashboard, when the configuration is created.
+- The code exchange returns the final access token directly. There is no
+  separate "exchange for a long-lived token" step, and the token is a
+  System-User token that is configured to not expire, so ``refresh_tokens``
+  has nothing to do -- it exists only to produce a clear error if it is
+  ever reached.
+- ``/me`` returns the system user, not an Instagram account. The connected
+  Instagram professional account(s) are discovered via
+  ``/me/assigned_instagram_accounts``, and that id (not ``me``) is what
+  every publish/metrics call targets.
+- Every Graph API call goes through ``graph.facebook.com`` instead of
+  ``graph.instagram.com``; most request/response shapes are unchanged.
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 from urllib.parse import urlencode
 
@@ -36,17 +45,10 @@ from .base import (
 
 logger = logging.getLogger(__name__)
 
-API_VERSION = "v21.0"
-AUTHORIZE_URL = "https://www.instagram.com/oauth/authorize"
-SHORT_TOKEN_URL = "https://api.instagram.com/oauth/access_token"
-GRAPH_BASE = "https://graph.instagram.com"
-GRAPH_API = f"{GRAPH_BASE}/{API_VERSION}"
-
-SCOPES = (
-    "instagram_business_basic",
-    "instagram_business_content_publish",
-    "instagram_business_manage_insights",
-)
+API_VERSION = "v23.0"
+AUTHORIZE_URL = "https://www.facebook.com/dialog/oauth"
+TOKEN_URL = f"https://graph.facebook.com/{API_VERSION}/oauth/access_token"
+GRAPH_API = f"https://graph.facebook.com/{API_VERSION}"
 
 CAPTION_MAX_LENGTH = 2200
 CONTAINER_POLL_INTERVAL_SECONDS = 5
@@ -71,17 +73,23 @@ class InstagramProvider(SocialProvider):
 
     @property
     def is_configured(self) -> bool:
-        return bool(self.config.instagram_app_id and self.config.instagram_app_secret)
+        return bool(
+            self.config.instagram_app_id
+            and self.config.instagram_app_secret
+            and self.config.instagram_config_id
+        )
 
     # -- OAuth ----------------------------------------------------------
     def build_authorize_url(
         self, *, state: str, redirect_uri: str, code_challenge: Optional[str] = None
     ) -> str:
+        # Unified Login configurations carry their own permission set; a
+        # ``scope`` parameter here is not used and would be ignored.
         params = {
             "client_id": self.config.instagram_app_id,
+            "config_id": self.config.instagram_config_id,
             "redirect_uri": redirect_uri,
             "response_type": "code",
-            "scope": ",".join(SCOPES),
             "state": state,
         }
         return f"{AUTHORIZE_URL}?{urlencode(params)}"
@@ -89,14 +97,11 @@ class InstagramProvider(SocialProvider):
     def exchange_code(
         self, *, code: str, redirect_uri: str, code_verifier: Optional[str] = None
     ) -> OAuthTokens:
-        # Instagram appends "#_" to the code in some redirects.
-        code = code.split("#")[0]
-        response = self.http.post(
-            SHORT_TOKEN_URL,
-            data={
+        response = self.http.get(
+            TOKEN_URL,
+            params={
                 "client_id": self.config.instagram_app_id,
                 "client_secret": self.config.instagram_app_secret,
-                "grant_type": "authorization_code",
                 "redirect_uri": redirect_uri,
                 "code": code,
             },
@@ -106,94 +111,70 @@ class InstagramProvider(SocialProvider):
             raise SocialProviderError(
                 f"Instagram token exchange failed: {self._extract_error(response)}"
             )
-        short_payload = response.json()
-        short_token = short_payload.get("access_token")
-        if not short_token:
-            raise SocialProviderError("Instagram did not return an access token")
-
-        long_response = self.http.get(
-            f"{GRAPH_BASE}/access_token",
-            params={
-                "grant_type": "ig_exchange_token",
-                "client_secret": self.config.instagram_app_secret,
-                "access_token": short_token,
-            },
-            timeout=DEFAULT_HTTP_TIMEOUT,
-        )
-        if long_response.status_code >= 400:
-            raise SocialProviderError(
-                "Instagram long-lived token exchange failed: "
-                f"{self._extract_error(long_response)}"
-            )
-        long_payload = long_response.json()
-        tokens = self._parse_long_lived(long_payload)
-        tokens.raw["user_id"] = short_payload.get("user_id")
-        tokens.scopes = ",".join(SCOPES)
-        return tokens
-
-    def refresh_tokens(self, refresh_token: str) -> OAuthTokens:
-        # Long-lived Instagram tokens refresh themselves; the "refresh token"
-        # we store is simply the current long-lived token.
-        response = self.http.get(
-            f"{GRAPH_BASE}/refresh_access_token",
-            params={"grant_type": "ig_refresh_token", "access_token": refresh_token},
-            timeout=DEFAULT_HTTP_TIMEOUT,
-        )
-        if response.status_code >= 400:
-            raise SocialProviderError(
-                f"Instagram token refresh failed: {self._extract_error(response)}",
-                reauth=True,
-            )
-        return self._parse_long_lived(response.json())
-
-    @staticmethod
-    def _parse_long_lived(payload: Dict[str, Any]) -> OAuthTokens:
+        payload = response.json()
         token = payload.get("access_token")
         if not token:
-            raise SocialProviderError("Instagram did not return a long-lived token")
-        expires_in = payload.get("expires_in")
-        expires_at = None
-        if expires_in:
-            expires_at = datetime.now(timezone.utc) + timedelta(seconds=int(expires_in))
+            raise SocialProviderError("Instagram did not return an access token")
+        # Configured to never expire (System-User Access Token); if an
+        # operator's configuration sets an expiry, Meta includes expires_in.
         return OAuthTokens(
             access_token=token,
-            refresh_token=token,
-            expires_at=expires_at,
+            refresh_token=None,
+            expires_at=None,
             raw={"token_type": payload.get("token_type")},
         )
 
-    # Instagram Login has no token revocation endpoint (users remove the app
-    # from their Instagram settings), so ``revoke_tokens`` keeps the base
-    # no-op; disconnecting still deletes the stored token.
+    def refresh_tokens(self, refresh_token: str) -> OAuthTokens:
+        # Unified Login's System-User Access Token is configured to never
+        # expire and has no documented refresh grant. _get_valid_access_token
+        # never calls this because exchange_code never sets expires_at /
+        # refresh_token -- reaching it means the stored token was revoked.
+        raise SocialProviderError(
+            "Instagram's access token does not support refreshing; reconnect the account.",
+            reauth=True,
+        )
+
+    # Unified Login has no token revocation endpoint (users remove the app
+    # from their Instagram/Business settings), so ``revoke_tokens`` keeps the
+    # base no-op; disconnecting still deletes the stored token.
 
     def fetch_profile(self, access_token: str) -> AccountProfile:
-        response = self.http.get(
-            f"{GRAPH_API}/me",
-            params={"fields": "id,user_id,username,name,profile_picture_url,account_type"},
+        accounts_response = self.http.get(
+            f"{GRAPH_API}/me/assigned_instagram_accounts",
+            params={"fields": "id,username"},
             headers=self._auth_headers(access_token),
             timeout=DEFAULT_HTTP_TIMEOUT,
         )
-        self._raise_for_status(response, "load the Instagram profile")
-        payload = response.json()
-        ig_id = str(payload.get("user_id") or payload.get("id") or "")
+        self._raise_for_status(accounts_response, "list connected Instagram accounts")
+        accounts = accounts_response.json().get("data") or []
+        if not accounts:
+            raise SocialProviderError(
+                "No Instagram professional account was granted during login. Grant access to "
+                "a Business or Creator Instagram account and try connecting again."
+            )
+        ig_id = str(accounts[0].get("id") or "")
+        username = accounts[0].get("username")
         if not ig_id:
             raise SocialProviderError("Instagram did not return an account id")
-        account_type = payload.get("account_type")
-        if account_type and account_type.upper() not in {"BUSINESS", "MEDIA_CREATOR", "CREATOR"}:
-            raise SocialProviderError(
-                "Instagram publishing requires a professional (Business or Creator) "
-                f"account; this account is '{account_type}'."
-            )
+
+        # No account_type check here: assigned_instagram_accounts only ever
+        # lists accounts that belong to a Business Portfolio, and a personal
+        # account can't be added to one, so every result is already
+        # professional. (account_type also isn't a valid field on this node.)
+        detail_response = self.http.get(
+            f"{GRAPH_API}/{ig_id}",
+            params={"fields": "name,profile_picture_url"},
+            headers=self._auth_headers(access_token),
+            timeout=DEFAULT_HTTP_TIMEOUT,
+        )
+        self._raise_for_status(detail_response, "load the Instagram profile")
+        detail = detail_response.json()
         return AccountProfile(
             external_account_id=ig_id,
-            display_name=payload.get("name") or payload.get("username"),
-            username=payload.get("username"),
-            avatar_url=payload.get("profile_picture_url"),
-            metadata={
-                "ig_user_id": ig_id,
-                "app_scoped_id": payload.get("id"),
-                "account_type": account_type,
-            },
+            display_name=detail.get("name") or username,
+            username=username,
+            avatar_url=detail.get("profile_picture_url"),
+            metadata={"ig_user_id": ig_id},
         )
 
     # -- publishing -----------------------------------------------------
@@ -203,10 +184,15 @@ class InstagramProvider(SocialProvider):
                 "Instagram needs a publicly reachable video URL. Set NEXT_PUBLIC_APP_URL "
                 "(or SOCIAL_PUBLIC_MEDIA_BASE_URL) to a URL Instagram can fetch."
             )
+        ig_user_id = request.account_metadata.get("ig_user_id")
+        if not ig_user_id:
+            raise SocialProviderError(
+                "This account is missing its Instagram account id; reconnect it.", reauth=True
+            )
         caption = build_caption(request.caption or request.title, request.hashtags, CAPTION_MAX_LENGTH)
 
         create_response = self.http.post(
-            f"{GRAPH_API}/me/media",
+            f"{GRAPH_API}/{ig_user_id}/media",
             data={
                 "media_type": "REELS",
                 "video_url": request.public_media_url,
@@ -227,7 +213,7 @@ class InstagramProvider(SocialProvider):
         # the reel even if its response is lost.
         with ambiguous_outcome("publish the Instagram reel"):
             publish_response = self.http.post(
-                f"{GRAPH_API}/me/media_publish",
+                f"{GRAPH_API}/{ig_user_id}/media_publish",
                 data={"creation_id": container_id},
                 headers=self._auth_headers(access_token),
                 timeout=DEFAULT_HTTP_TIMEOUT,
@@ -325,7 +311,7 @@ class InstagramProvider(SocialProvider):
     def _auth_headers(access_token: str) -> Dict[str, str]:
         # Graph API calls take the token as a header so it never lands in a
         # URL (and from there in exception messages or proxy logs). The token
-        # exchange and refresh endpoints only accept query parameters.
+        # exchange endpoint only accepts query parameters.
         return {"Authorization": f"Bearer {access_token}"}
 
     def _raise_for_status(self, response, action: str) -> None:

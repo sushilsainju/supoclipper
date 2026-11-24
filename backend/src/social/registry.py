@@ -21,7 +21,10 @@ _PROVIDER_CLASSES: Dict[str, Type[SocialProvider]] = {
 PROVIDER_SETUP_HINTS = {
     "youtube": "Set YOUTUBE_OAUTH_CLIENT_ID and YOUTUBE_OAUTH_CLIENT_SECRET from a Google Cloud OAuth client.",
     "tiktok": "Set TIKTOK_CLIENT_KEY and TIKTOK_CLIENT_SECRET from the TikTok for Developers portal.",
-    "instagram": "Set INSTAGRAM_APP_ID and INSTAGRAM_APP_SECRET from a Meta app with Instagram Login.",
+    "instagram": (
+        "Set INSTAGRAM_APP_ID, INSTAGRAM_APP_SECRET and INSTAGRAM_CONFIG_ID from a Meta app's "
+        "\"API setup with Unified login\"."
+    ),
 }
 
 
