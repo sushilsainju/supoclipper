@@ -69,7 +69,7 @@ describe("init.sql matches the Prisma schema", () => {
   it("keeps the catch-up script safe to run twice", () => {
     const statements = repairSql.split(";").map((s) => s.replace(/--.*$/gm, "").trim()).filter(Boolean);
     for (const statement of statements) {
-      expect(statement).toMatch(/IF NOT EXISTS/);
+      expect(statement).toMatch(/IF NOT EXISTS|ON CONFLICT/);
     }
   });
 });
