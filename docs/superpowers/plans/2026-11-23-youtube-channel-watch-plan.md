@@ -112,6 +112,8 @@ ON CONFLICT (key) DO NOTHING;
 
 Check `src/migrations/sql/` for any other file already dated `20261123_*` before naming this one, to avoid a filename collision (sort order only matters relative to files it doesn't depend on, but a collision would silently skip one file).
 
+Also mirror this migration's `CREATE TABLE`/`CREATE INDEX`/`INSERT` statements into the root `init.sql`, in the section alongside the other feature-flag seed rows and table definitions — this repo's convention (per `CLAUDE.md`'s "Adding a flag" note) is to keep `init.sql` in sync with each migration so a from-scratch install's bootstrap schema matches what an existing instance ends up with after migrations run. Functionally the migration file alone is sufficient (a fresh install's data volume is empty, so every migration still applies), but `init.sql` should read as the accurate current schema.
+
 - [ ] **Step 2: Write the migration test**
 
 ```python
@@ -371,7 +373,7 @@ git commit -m "feat: add channel-watch cron poller"
 
 **Interfaces:**
 - Consumes: `SesEmailService`/`EmailContent` from `src/services/email_service.py`, `email_button()`/layout helpers from `src/services/email_layout.py` (mirror `SocialPublishEmailService`'s exact usage).
-- Produces: `ChannelWatchEmailService.send_stream_ready_email(*, recipient: str, channel_title: Optional[str], video_url: str, duration_seconds: int) -> dict`. Migration adds `users.notify_on_channel_watch BOOLEAN NOT NULL DEFAULT true` and `channel_watch_suggestions.notified_at TIMESTAMPTZ`.
+- Produces: `ChannelWatchEmailService.send_stream_ready_email(*, recipient: str, channel_title: Optional[str], video_url: str, duration_seconds: int) -> dict`. Migration adds `users.notify_on_channel_watch BOOLEAN NOT NULL DEFAULT true` and `channel_watch_suggestions.notified_at TIMESTAMPTZ`. Also produces `ChannelWatchSuggestionRepository.mark_notified(db, suggestion_id: str) -> None` (extends Task 2's class).
 
 - [ ] **Step 1: Write the migration**
 
@@ -379,6 +381,10 @@ git commit -m "feat: add channel-watch cron poller"
 ALTER TABLE users ADD COLUMN IF NOT EXISTS notify_on_channel_watch BOOLEAN NOT NULL DEFAULT true;
 ALTER TABLE channel_watch_suggestions ADD COLUMN IF NOT EXISTS notified_at TIMESTAMPTZ;
 ```
+
+Also mirror both `ALTER TABLE` statements into the root `init.sql`'s column list for `users` and `channel_watch_suggestions` (same convention as Task 1 — functionally this migration file alone is sufficient, but `init.sql` should stay an accurate schema reference).
+
+Add one more method to `ChannelWatchSuggestionRepository` (from Task 2) to persist this column: `ChannelWatchSuggestionRepository.mark_notified(db, suggestion_id: str) -> None` — sets `notified_at = now()`. Task 2 didn't know about this column yet when it ran; this task owns adding it.
 
 - [ ] **Step 2: Write a failing test for `send_stream_ready_email`**
 
