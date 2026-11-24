@@ -14,7 +14,7 @@ EXPECTED_WATCH_COLUMNS = {
 }
 EXPECTED_SUGGESTION_COLUMNS = {
     "id", "channel_watch_id", "user_id", "video_id", "video_url", "duration_seconds",
-    "status", "task_id", "created_at",
+    "status", "task_id", "created_at", "notified_at",
 }
 
 
