@@ -5,6 +5,7 @@
 -- On an existing install: docker compose exec -T postgres psql -U supoclip -d supoclip < scripts/selfhost-schema-repair.sql
 
 ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_account_id VARCHAR(255);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS notify_on_channel_watch BOOLEAN NOT NULL DEFAULT true;
 
 ALTER TABLE stripe_webhook_events ADD COLUMN IF NOT EXISTS claim_token VARCHAR(255);
 ALTER TABLE stripe_webhook_events ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMP WITH TIME ZONE;
@@ -196,6 +197,7 @@ CREATE TABLE IF NOT EXISTS channel_watch_suggestions (
     duration_seconds INTEGER,
     status VARCHAR(20) NOT NULL DEFAULT 'pending',
     task_id VARCHAR(36),
+    notified_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_channel_watch_suggestions_user ON channel_watch_suggestions(user_id, status);

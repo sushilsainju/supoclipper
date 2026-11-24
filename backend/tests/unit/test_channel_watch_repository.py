@@ -333,9 +333,25 @@ async def test_list_pending_for_user_filters_by_user_and_pending_status():
 
     sql, params = session.calls[0]
     assert "user_id = :user_id" in sql
-    assert "status = 'pending'" in sql
+    assert "status IN ('pending', 'failed')" in sql
     assert params == {"user_id": "user-1"}
     assert [s["id"] for s in suggestions] == ["sugg-1"]
+
+
+async def test_list_pending_for_user_also_includes_failed_suggestions():
+    # Review Focus: a status="failed" suggestion (e.g. VOD duration never
+    # resolved before the ended_pending_vod timeout) must surface here too,
+    # not just "pending" ones — otherwise it's created and then never shown.
+    session = _FakeSession([[_suggestion_row(id="sugg-pending", status="pending"), _suggestion_row(id="sugg-failed", status="failed", duration_seconds=None)]])
+
+    suggestions = await ChannelWatchSuggestionRepository.list_pending_for_user(session, "user-1")
+
+    sql, _ = session.calls[0]
+    assert "status IN ('pending', 'failed')" in sql
+    assert {s["id"]: s["status"] for s in suggestions} == {
+        "sugg-pending": "pending",
+        "sugg-failed": "failed",
+    }
 
 
 async def test_suggestion_get_by_id_returns_none_when_missing():

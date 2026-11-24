@@ -300,12 +300,15 @@ class ChannelWatchSuggestionRepository:
 
     @staticmethod
     async def list_pending_for_user(db: AsyncSession, user_id: str) -> List[Dict[str, Any]]:
-        """Return the user's suggestions still awaiting a decision, newest first."""
+        """Return the user's suggestions still awaiting a decision, plus any that
+        failed (e.g. VOD resolution timed out) so the failure surfaces instead of
+        vanishing silently. Newest first; callers distinguish by ``status``.
+        """
         result = await db.execute(
             text(
                 f"""
                 SELECT {_SUGGESTION_COLUMNS} FROM channel_watch_suggestions
-                WHERE user_id = :user_id AND status = 'pending'
+                WHERE user_id = :user_id AND status IN ('pending', 'failed')
                 ORDER BY created_at DESC
                 """
             ),

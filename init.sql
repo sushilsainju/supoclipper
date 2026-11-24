@@ -464,6 +464,7 @@ CREATE TRIGGER update_verification_updatedAt BEFORE UPDATE ON verification FOR E
 -- On an existing install: docker compose exec -T postgres psql -U supoclip -d supoclip < scripts/selfhost-schema-repair.sql
 
 ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_account_id VARCHAR(255);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS notify_on_channel_watch BOOLEAN NOT NULL DEFAULT true;
 
 ALTER TABLE stripe_webhook_events ADD COLUMN IF NOT EXISTS claim_token VARCHAR(255);
 ALTER TABLE stripe_webhook_events ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMP WITH TIME ZONE;

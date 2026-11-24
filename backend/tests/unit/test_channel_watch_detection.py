@@ -5,6 +5,7 @@ tracking calls, plus the hard quota constraint that live *discovery*
 (`probe_channel_live`) must never use the Data API.
 """
 import pytest
+import yt_dlp
 
 from src import channel_watch_detection as detection
 from src.config import Config, set_config_override
@@ -41,7 +42,7 @@ async def test_resolve_channel_returns_resolved_channel_via_data_api_when_key_co
     def fake_data_api_request(url, params):
         assert "forHandle" in params
         assert params["forHandle"] == "@SomeChannel"
-        return {"items": [{"id": "UCabc123", "snippet": {"title": "Some Channel"}}]}
+        return {"items": [{"id": "UCabcdefghijklmnopqrstuv", "snippet": {"title": "Some Channel"}}]}
 
     def fake_ytdlp_extract_info(url, opts):
         raise AssertionError("yt-dlp must not be used when the Data API succeeds")
@@ -51,7 +52,7 @@ async def test_resolve_channel_returns_resolved_channel_via_data_api_when_key_co
 
     result = await detection.resolve_channel("@SomeChannel")
 
-    assert result == detection.ResolvedChannel(channel_id="UCabc123", title="Some Channel")
+    assert result == detection.ResolvedChannel(channel_id="UCabcdefghijklmnopqrstuv", title="Some Channel")
 
 
 async def test_resolve_channel_falls_back_to_yt_dlp_on_data_api_failure(
@@ -85,6 +86,39 @@ async def test_resolve_channel_returns_none_for_unresolvable_input(
     monkeypatch.setattr(detection, "_ytdlp_extract_info", fake_ytdlp_extract_info)
 
     result = await detection.resolve_channel("not-a-real-channel-typo")
+
+    assert result is None
+
+
+async def test_resolve_channel_returns_none_for_non_youtube_url(config_with_key, monkeypatch):
+    # Review Focus case: a Twitch URL must not resolve at all — not via the
+    # Data API (its path would otherwise parse as a bare username and could
+    # match an unrelated YouTube channel) and not via yt-dlp's own, non-YouTube
+    # extractor for that host.
+    def fake_data_api_request(url, params):
+        raise AssertionError("A non-YouTube URL must never reach the Data API")
+
+    def fake_ytdlp_extract_info(url, opts):
+        raise AssertionError("A non-YouTube URL must never reach yt-dlp either")
+
+    monkeypatch.setattr(detection, "_data_api_request", fake_data_api_request)
+    monkeypatch.setattr(detection, "_ytdlp_extract_info", fake_ytdlp_extract_info)
+
+    result = await detection.resolve_channel("https://twitch.tv/foo")
+
+    assert result is None
+
+
+def test_resolve_channel_via_data_api_rejects_a_malformed_channel_id(monkeypatch):
+    # A forUsername/forHandle lookup that somehow returns an id not shaped
+    # like a real YouTube channel id (UC + 22 chars) must be treated as
+    # unresolved rather than handed back as a resolved channel.
+    def fake_data_api_request(url, params):
+        return {"items": [{"id": "not-a-channel-id", "snippet": {"title": "Bogus"}}]}
+
+    monkeypatch.setattr(detection, "_data_api_request", fake_data_api_request)
+
+    result = detection._resolve_channel_via_data_api("@SomeChannel", "test-data-api-key")
 
     assert result is None
 
@@ -176,6 +210,46 @@ async def test_has_broadcast_ended_false_while_still_live(config_with_key, monke
     result = await detection.has_broadcast_ended("liveVideo123")
 
     assert result is False
+
+
+async def test_has_broadcast_ended_true_when_video_is_gone(config_with_key, monkeypatch):
+    # Review Focus case: a deleted/private/never-archived video must count as
+    # ended (not stay stuck in state=live forever). The Data API successfully
+    # queries the id and finds nothing — distinct from "still live" (an item
+    # with no actualEndTime) and "genuinely ended" (an item with
+    # actualEndTime set).
+    def fake_data_api_request(url, params):
+        assert params["id"] == "goneVideo123"
+        return {"items": []}
+
+    def fake_ytdlp_extract_info(url, opts):
+        raise AssertionError("yt-dlp must not be used when the Data API gives a conclusive answer")
+
+    monkeypatch.setattr(detection, "_data_api_request", fake_data_api_request)
+    monkeypatch.setattr(detection, "_ytdlp_extract_info", fake_ytdlp_extract_info)
+
+    result = await detection.has_broadcast_ended("goneVideo123")
+
+    assert result is True
+
+
+async def test_has_broadcast_ended_true_when_yt_dlp_reports_video_unavailable(
+    config_without_key, monkeypatch,
+):
+    # Same "video is gone" case, but reached via the yt-dlp fallback (no Data
+    # API key configured) — yt-dlp raises instead of returning an empty
+    # result for an unavailable video.
+    def fake_ytdlp_extract_info(url, opts):
+        assert "goneVideo123" in url
+        raise yt_dlp.utils.DownloadError(
+            "ERROR: [youtube] goneVideo123: Video unavailable. This video has been removed by the uploader"
+        )
+
+    monkeypatch.setattr(detection, "_ytdlp_extract_info", fake_ytdlp_extract_info)
+
+    result = await detection.has_broadcast_ended("goneVideo123")
+
+    assert result is True
 
 
 async def test_has_broadcast_ended_falls_back_to_yt_dlp_on_data_api_error(config_with_key, monkeypatch):
