@@ -267,6 +267,70 @@ CHANNEL_WATCH_IDLE_SWEEP_INTERVAL_SECONDS = 300
 CHANNEL_WATCH_VOD_TIMEOUT_SECONDS = 7200
 
 
+async def _send_channel_watch_notification_if_needed(db, suggestion_id: str) -> None:
+    """Email the owner that their watched channel's VOD is ready to clip.
+
+    Mirrors ``SocialService._send_publish_notification_if_needed``: every step
+    is wrapped so a failure here (missing context, SES down, a bad send) never
+    breaks the cron tick that created the suggestion.
+    """
+    from ..repositories.channel_watch_repository import ChannelWatchSuggestionRepository
+    from ..services.channel_watch_email_service import ChannelWatchEmailService
+
+    try:
+        context = await ChannelWatchSuggestionRepository.get_notification_context(
+            db, suggestion_id
+        )
+    except Exception:  # noqa: BLE001 - notification must never fail the poll
+        logger.exception(
+            "Failed to load channel-watch notification context for suggestion %s",
+            suggestion_id,
+        )
+        return
+    if not context:
+        logger.warning(
+            "Channel-watch suggestion %s missing notification context; skipping email",
+            suggestion_id,
+        )
+        return
+    if not context.get("notify_on_channel_watch"):
+        return
+    if context.get("notified_at"):
+        logger.info(
+            "Channel-watch notification already sent for suggestion %s; skipping",
+            suggestion_id,
+        )
+        return
+    user_email = context.get("user_email")
+    if not user_email:
+        logger.warning(
+            "Channel-watch suggestion %s has notify_on_channel_watch enabled but "
+            "user email is missing",
+            suggestion_id,
+        )
+        return
+    email_service = ChannelWatchEmailService()
+    if not email_service.is_configured:
+        logger.warning(
+            "Skipping channel-watch notification for suggestion %s because Amazon "
+            "SES is not configured",
+            suggestion_id,
+        )
+        return
+    try:
+        await email_service.send_stream_ready_email(
+            recipient=user_email,
+            channel_title=context.get("channel_title"),
+            video_url=context["video_url"],
+            duration_seconds=context.get("duration_seconds") or 0,
+        )
+        await ChannelWatchSuggestionRepository.mark_notified(db, suggestion_id)
+    except Exception:  # noqa: BLE001 - notification must never fail the poll
+        logger.exception(
+            "Failed to send channel-watch notification for suggestion %s", suggestion_id
+        )
+
+
 async def poll_channel_watches(ctx: Dict[str, Any]) -> Dict[str, Any]:
     """Cron: advance every enabled YouTube channel watch through its state machine.
 
@@ -351,7 +415,7 @@ async def poll_channel_watches(ctx: Dict[str, Any]) -> Dict[str, Any]:
                     f"https://www.youtube.com/watch?v={video_id}"
                 )
                 if has_verified_duration(video_info):
-                    await ChannelWatchSuggestionRepository.create(
+                    suggestion = await ChannelWatchSuggestionRepository.create(
                         db,
                         channel_watch_id=watch["id"],
                         user_id=watch["user_id"],
@@ -362,6 +426,7 @@ async def poll_channel_watches(ctx: Dict[str, Any]) -> Dict[str, Any]:
                     )
                     await ChannelWatchRepository.reset_to_idle(db, watch["id"])
                     suggestions_created += 1
+                    await _send_channel_watch_notification_if_needed(db, suggestion["id"])
                     continue
 
                 ended_at = watch.get("ended_at")

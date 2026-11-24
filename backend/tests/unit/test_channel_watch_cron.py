@@ -316,6 +316,199 @@ async def test_poll_continues_past_one_rows_exception(monkeypatch):
     assert result["errors"] == 1
 
 
+def _suggestion(**overrides):
+    base = {
+        "id": "sugg-1",
+        "channel_watch_id": "watch-1",
+        "user_id": "user-1",
+        "video_id": "video-999",
+        "video_url": "https://www.youtube.com/watch?v=video-999",
+        "duration_seconds": 1234,
+        "status": "pending",
+        "task_id": None,
+        "created_at": None,
+    }
+    base.update(overrides)
+    return base
+
+
+def _notification_context(**overrides):
+    base = {
+        "suggestion_id": "sugg-1",
+        "channel_watch_id": "watch-1",
+        "video_id": "video-999",
+        "video_url": "https://www.youtube.com/watch?v=video-999",
+        "duration_seconds": 1234,
+        "notified_at": None,
+        "notify_on_channel_watch": True,
+        "user_email": "ada@example.com",
+        "user_name": "Ada Lovelace",
+        "user_first_name": "Ada",
+        "channel_title": "Some Channel",
+    }
+    base.update(overrides)
+    return base
+
+
+def _setup_vod_resolved(monkeypatch, *, context=None):
+    """Common setup for the VOD-resolution phase: one ended_pending_vod watch
+    whose VOD duration has just resolved, so a suggestion is created.
+    """
+    ended_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+    watch = _watch(state="ended_pending_vod", active_live_video_id="video-999", ended_at=ended_at)
+    monkeypatch.setattr("src.database.AsyncSessionLocal", _fake_async_session_local())
+    _patch_repo_defaults(monkeypatch, tracking=[watch])
+    monkeypatch.setattr(feature_flags, "is_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        youtube_utils, "async_get_youtube_video_info", AsyncMock(return_value={"duration": 1234})
+    )
+    monkeypatch.setattr(
+        ChannelWatchSuggestionRepository, "create", AsyncMock(return_value=_suggestion())
+    )
+    monkeypatch.setattr(ChannelWatchRepository, "reset_to_idle", AsyncMock())
+    monkeypatch.setattr(
+        ChannelWatchSuggestionRepository,
+        "get_notification_context",
+        AsyncMock(return_value=context if context is not None else _notification_context()),
+    )
+    mark_notified = AsyncMock()
+    monkeypatch.setattr(ChannelWatchSuggestionRepository, "mark_notified", mark_notified)
+    return mark_notified
+
+
+# ---------------------------------------------------------------------------
+# Phase 3b: notify the user once a pending suggestion is created
+# ---------------------------------------------------------------------------
+
+
+async def test_poll_sends_channel_watch_notification_when_suggestion_created(monkeypatch):
+    mark_notified = _setup_vod_resolved(monkeypatch)
+    send_email = AsyncMock(return_value={"MessageId": "msg-1"})
+
+    class FakeChannelWatchEmailService:
+        def __init__(self):
+            self.is_configured = True
+
+        send_stream_ready_email = send_email
+
+    monkeypatch.setattr(
+        "src.services.channel_watch_email_service.ChannelWatchEmailService",
+        FakeChannelWatchEmailService,
+    )
+
+    result = await tasks.poll_channel_watches({})
+
+    send_email.assert_awaited_once()
+    _, kwargs = send_email.call_args
+    assert kwargs["recipient"] == "ada@example.com"
+    assert kwargs["channel_title"] == "Some Channel"
+    assert kwargs["video_url"] == "https://www.youtube.com/watch?v=video-999"
+    assert kwargs["duration_seconds"] == 1234
+    mark_notified.assert_awaited_once()
+    assert mark_notified.call_args.args[1] == "sugg-1"
+    assert result["suggestions_created"] == 1
+    assert result["errors"] == 0
+
+
+async def test_poll_skips_email_when_notify_toggle_is_off(monkeypatch):
+    mark_notified = _setup_vod_resolved(
+        monkeypatch, context=_notification_context(notify_on_channel_watch=False)
+    )
+    send_email = AsyncMock()
+
+    class FakeChannelWatchEmailService:
+        def __init__(self):
+            self.is_configured = True
+
+        send_stream_ready_email = send_email
+
+    monkeypatch.setattr(
+        "src.services.channel_watch_email_service.ChannelWatchEmailService",
+        FakeChannelWatchEmailService,
+    )
+
+    result = await tasks.poll_channel_watches({})
+
+    send_email.assert_not_awaited()
+    mark_notified.assert_not_awaited()
+    assert result["suggestions_created"] == 1
+    assert result["errors"] == 0
+
+
+async def test_poll_does_not_resend_email_once_notified_at_is_set(monkeypatch):
+    mark_notified = _setup_vod_resolved(
+        monkeypatch,
+        context=_notification_context(notified_at=datetime.now(timezone.utc)),
+    )
+    send_email = AsyncMock()
+
+    class FakeChannelWatchEmailService:
+        def __init__(self):
+            self.is_configured = True
+
+        send_stream_ready_email = send_email
+
+    monkeypatch.setattr(
+        "src.services.channel_watch_email_service.ChannelWatchEmailService",
+        FakeChannelWatchEmailService,
+    )
+
+    result = await tasks.poll_channel_watches({})
+
+    send_email.assert_not_awaited()
+    mark_notified.assert_not_awaited()
+    assert result["suggestions_created"] == 1
+    assert result["errors"] == 0
+
+
+async def test_poll_skips_email_when_ses_not_configured(monkeypatch):
+    mark_notified = _setup_vod_resolved(monkeypatch)
+    send_email = AsyncMock()
+
+    class FakeChannelWatchEmailService:
+        def __init__(self):
+            self.is_configured = False
+
+        send_stream_ready_email = send_email
+
+    monkeypatch.setattr(
+        "src.services.channel_watch_email_service.ChannelWatchEmailService",
+        FakeChannelWatchEmailService,
+    )
+
+    result = await tasks.poll_channel_watches({})
+
+    send_email.assert_not_awaited()
+    mark_notified.assert_not_awaited()
+    assert result["suggestions_created"] == 1
+    assert result["errors"] == 0
+
+
+async def test_poll_tick_survives_channel_watch_email_send_failure(monkeypatch):
+    """A failed notification send must never break the poll or the row's own
+    accounting - matching ``_send_publish_notification_if_needed``'s pattern."""
+    mark_notified = _setup_vod_resolved(monkeypatch)
+    send_email = AsyncMock(side_effect=RuntimeError("SES down"))
+
+    class FakeChannelWatchEmailService:
+        def __init__(self):
+            self.is_configured = True
+
+        send_stream_ready_email = send_email
+
+    monkeypatch.setattr(
+        "src.services.channel_watch_email_service.ChannelWatchEmailService",
+        FakeChannelWatchEmailService,
+    )
+
+    result = await tasks.poll_channel_watches({})
+
+    send_email.assert_awaited_once()
+    mark_notified.assert_not_awaited()
+    assert result["suggestions_created"] == 1
+    assert result["errors"] == 0
+
+
 async def test_poll_continues_past_one_rows_exception_in_tracking_phase(monkeypatch):
     """One tracking row's (``live`` or ``ended_pending_vod``) exception must not stop the
     other row in the same loop from being checked."""

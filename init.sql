@@ -22,6 +22,7 @@ CREATE TABLE users (
     default_font_color VARCHAR(7) DEFAULT '#FFFFFF',
     notify_on_completion BOOLEAN NOT NULL DEFAULT true,
     notify_on_publish BOOLEAN NOT NULL DEFAULT false,
+    notify_on_channel_watch BOOLEAN NOT NULL DEFAULT true,
     default_clip_length VARCHAR(10) NOT NULL DEFAULT 'auto'
         CONSTRAINT users_default_clip_length_check CHECK (default_clip_length IN ('auto', 'short', 'medium', 'long')),
     create_settings JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -654,6 +655,7 @@ CREATE TABLE IF NOT EXISTS channel_watch_suggestions (
     duration_seconds INTEGER,
     status VARCHAR(20) NOT NULL DEFAULT 'pending',
     task_id VARCHAR(36),
+    notified_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_channel_watch_suggestions_user ON channel_watch_suggestions(user_id, status);

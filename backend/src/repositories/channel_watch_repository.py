@@ -354,3 +354,66 @@ class ChannelWatchSuggestionRepository:
             {"suggestion_id": suggestion_id},
         )
         await db.commit()
+
+    @staticmethod
+    async def mark_notified(db: AsyncSession, suggestion_id: str) -> None:
+        """Record that the "stream is ready" email was sent for this suggestion."""
+        await db.execute(
+            text(
+                """
+                UPDATE channel_watch_suggestions
+                SET notified_at = NOW()
+                WHERE id = :suggestion_id
+                """
+            ),
+            {"suggestion_id": suggestion_id},
+        )
+        await db.commit()
+
+    @staticmethod
+    async def get_notification_context(
+        db: AsyncSession, suggestion_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Single joined row with everything needed to send (and gate) the
+        "stream is ready" email for one suggestion: the toggle and contact
+        info from ``users``, the channel's display name from ``channel_watches``.
+        """
+        result = await db.execute(
+            text(
+                """
+                SELECT
+                    s.id,
+                    s.channel_watch_id,
+                    s.video_id,
+                    s.video_url,
+                    s.duration_seconds,
+                    s.notified_at,
+                    u.notify_on_channel_watch,
+                    u.email AS user_email,
+                    u.name AS user_name,
+                    u.first_name AS user_first_name,
+                    w.resolved_channel_title
+                FROM channel_watch_suggestions s
+                JOIN users u ON u.id = s.user_id
+                JOIN channel_watches w ON w.id = s.channel_watch_id
+                WHERE s.id = :suggestion_id
+                """
+            ),
+            {"suggestion_id": suggestion_id},
+        )
+        row = result.fetchone()
+        if not row:
+            return None
+        return {
+            "suggestion_id": row.id,
+            "channel_watch_id": row.channel_watch_id,
+            "video_id": row.video_id,
+            "video_url": row.video_url,
+            "duration_seconds": row.duration_seconds,
+            "notified_at": row.notified_at,
+            "notify_on_channel_watch": row.notify_on_channel_watch,
+            "user_email": row.user_email,
+            "user_name": row.user_name,
+            "user_first_name": row.user_first_name,
+            "channel_title": row.resolved_channel_title,
+        }

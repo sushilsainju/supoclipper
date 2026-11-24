@@ -373,3 +373,72 @@ async def test_mark_dismissed_sets_status():
     assert "status = 'dismissed'" in sql
     assert params == {"suggestion_id": "sugg-1"}
     assert session.commits == 1
+
+
+# --- ChannelWatchSuggestionRepository.mark_notified / get_notification_context --
+
+
+async def test_mark_notified_sets_notified_at():
+    session = _FakeSession()
+
+    await ChannelWatchSuggestionRepository.mark_notified(session, "sugg-1")
+
+    sql, params = session.calls[0]
+    assert "notified_at = NOW()" in sql
+    assert params == {"suggestion_id": "sugg-1"}
+    assert session.commits == 1
+
+
+def _notification_context_row(**overrides):
+    values = {
+        "id": "sugg-1",
+        "channel_watch_id": "watch-1",
+        "video_id": "vid_abc",
+        "video_url": "https://www.youtube.com/watch?v=vid_abc",
+        "duration_seconds": 3600,
+        "notified_at": None,
+        "notify_on_channel_watch": True,
+        "user_email": "ada@example.com",
+        "user_name": "Ada Lovelace",
+        "user_first_name": "Ada",
+        "resolved_channel_title": "Ada's Channel",
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+async def test_get_notification_context_returns_none_when_missing():
+    session = _FakeSession([[]])
+
+    context = await ChannelWatchSuggestionRepository.get_notification_context(
+        session, "missing"
+    )
+
+    assert context is None
+    assert session.calls[0][1] == {"suggestion_id": "missing"}
+
+
+async def test_get_notification_context_joins_user_and_channel_fields():
+    session = _FakeSession([[_notification_context_row()]])
+
+    context = await ChannelWatchSuggestionRepository.get_notification_context(
+        session, "sugg-1"
+    )
+
+    sql, params = session.calls[0]
+    assert "JOIN users u ON u.id = s.user_id" in sql
+    assert "JOIN channel_watches w ON w.id = s.channel_watch_id" in sql
+    assert params == {"suggestion_id": "sugg-1"}
+    assert context == {
+        "suggestion_id": "sugg-1",
+        "channel_watch_id": "watch-1",
+        "video_id": "vid_abc",
+        "video_url": "https://www.youtube.com/watch?v=vid_abc",
+        "duration_seconds": 3600,
+        "notified_at": None,
+        "notify_on_channel_watch": True,
+        "user_email": "ada@example.com",
+        "user_name": "Ada Lovelace",
+        "user_first_name": "Ada",
+        "channel_title": "Ada's Channel",
+    }
